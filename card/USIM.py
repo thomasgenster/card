@@ -465,6 +465,46 @@ class USIM(UICC):
         # Otherwise assume GSM 7-bit
         return self._decode_gsm7(data)
 
+    def get_gid1(self):
+        """
+        get_gid1() -> string
+
+        Reads the Group Identifier Level 1 (GID1) from EF_GID1 (0x6F3E)
+
+        The GID1 is used to identify a group of SIMs for a particular
+        application. It's typically used for SIM-lock purposes.
+
+        Returns:
+            GID1 as hex string on success, or None on error
+
+        Example:
+            u = USIM()
+            print("GID1:", u.get_gid1())
+        """
+        # Select EF_GID1
+        EF = self.select([0x6F, 0x3E])
+        if EF is None:
+            return None
+
+        if 'Data' not in EF.keys() or len(EF['Data']) < 1:
+            return None
+
+        data = EF['Data']
+
+        # GID1 contains identifier bytes, 0xFF indicates unused bytes
+        # Filter out padding bytes and convert to hex string
+        gid1_bytes = []
+        for b in data:
+            if b == 0xFF:
+                break
+            gid1_bytes.append(b)
+
+        if not gid1_bytes:
+            return ''
+
+        # Return as hex string (common format for GID1)
+        return ''.join('%02X' % b for b in gid1_bytes)
+
     def get_spn(self):
         """
         get_spn() -> string
