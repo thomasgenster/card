@@ -54,437 +54,439 @@ class ISIM(UICC):
     
     Provides methods for IMS authentication using ISIM application
     Based on 3GPP TS 31.103 specification
+
+    Usage:
+        from card.ISIM import ISIM
+
+        isim = ISIM()
+        print("ISIM selected:", isim.ISIM_selected)
+
+        # Authenticate
+        RAND = [0xC0, 0x53, ...] # 16 bytes
+        AUTN = [0xB5, 0x21, ...] # 16 bytes
+        result = isim.authenticate(RAND, AUTN)
     """
-    
+
     # ISIM AID prefix: 3GPP RID (A000000087) + ISIM PIX (1004)
     AID_ISIM_prefix = [0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x04]
-    
+
+    dbg = 0  # Set to 1 or 2 for debug output
+
     def __init__(self, reader=''):
         """
         Initialize ISIM card connection
-        
-        Selects ISIM application from the available AIDs on the card
+
+        Selects ISIM application from the available AIDs on the card.
+        After init, check self.ISIM_selected to verify ISIM was selected.
         """
-        # Initialize parent UICC class
+        # Initialize parent ISO7816 class (like UICC does)
         ISO7816.__init__(self, CLA=0x00, reader=reader)
         self.AID = []
         self.AID_ISIM = None
-        
+        self.ISIM_selected = False
+
         if self.dbg >= 2:
             log(3, '(ISIM.__init__) type definition: %s' % type(self))
             log(3, '(ISIM.__init__) CLA definition: %s' % hex(self.CLA))
-        
+
         # Try to select ISIM ADF
-        self.SELECT_ADF_ISIM()
-    
+        self.ISIM_selected = self.SELECT_ADF_ISIM()
+
+        if self.dbg:
+            if self.ISIM_selected:
+                log(3, '(ISIM.__init__) ISIM application selected successfully')
+                log(3, '(ISIM.__init__) ISIM AID: %s' %
+                    ' '.join(['%02X' % b for b in self.AID_ISIM]))
+            else:
+                log(1, '(ISIM.__init__) WARNING: ISIM application NOT selected')
+
     def SELECT_ADF_ISIM(self):
         """
         Select the ISIM AID (Application IDentifier)
-        
+
         Returns True if ISIM AID exists and was selected, False otherwise
         """
         # First, scan for available AIDs in EF_DIR
         self._scan_AID()
-        
-        # Look for ISIM AID
+
+        if self.dbg:
+            log(3, '(SELECT_ADF_ISIM) Found %d AIDs on card' % len(self.AID))
+            for i, aid in enumerate(self.AID):
+                log(3, '  AID[%d]: %s' % (i, ' '.join(['%02X' % b for b in aid])))
+
+        # Look for ISIM AID (starts with A0 00 00 00 87 10 04)
         for aid in self.AID:
-            if aid[:7] == self.AID_ISIM_prefix:
+            if len(aid) >= 7 and aid[:7] == self.AID_ISIM_prefix:
                 self.AID_ISIM = aid
+                if self.dbg:
+                    log(3, '(SELECT_ADF_ISIM) Found ISIM AID')
                 break
-        
+
         if self.AID_ISIM is None:
             if self.dbg:
-                log(1, '(SELECT_ADF_ISIM) no ISIM AID found')
+                log(1, '(SELECT_ADF_ISIM) No ISIM AID found on card')
             return False
-        
-        # Select the ISIM application
+
+        # Select the ISIM application by AID
+        # P1=0x04 means "Select by DF name (AID)"
+        # P2=0x04 means "Return FCP template"
         self.coms.push(self.SELECT_FILE(P1=0x04, P2=0x04, Data=self.AID_ISIM))
-        
-        if self.coms()[2] == (0x90, 0x00):
-            if self.dbg >= 2:
-                log(3, '(SELECT_ADF_ISIM) ISIM AID selected successfully')
+
+        sw = self.coms()[2]
+        if self.dbg:
+            log(3, '(SELECT_ADF_ISIM) SELECT response SW: %02X %02X' % (sw[0], sw[1]))
+
+        if sw == (0x90, 0x00):
             return True
-        elif self.coms()[2][0] == 0x61:
-            # Get response for additional data
-            self.coms.push(self.GET_RESPONSE(Le=self.coms()[2][1]))
+        elif sw[0] == 0x61:
+            # More data available, get it
+            self.coms.push(self.GET_RESPONSE(Le=sw[1]))
             if self.coms()[2] == (0x90, 0x00):
                 return True
-        
+
         if self.dbg:
-            log(1, '(SELECT_ADF_ISIM) ISIM AID selection failed: %s' 
-                % self.coms()[2])
+            log(1, '(SELECT_ADF_ISIM) ISIM AID selection failed with SW: %02X %02X'
+                % (sw[0], sw[1]))
         return False
-    
+
     def _scan_AID(self):
         """
-        Scan EF_DIR for available AIDs
+        Scan EF_DIR for available AIDs on the card
         """
         self.AID = []
-        
+
         # Select MF first
         self.coms.push(self.SELECT_FILE(P1=0x00, P2=0x00, Data=[0x3F, 0x00]))
-        
-        # Select EF_DIR
+
+        # Select EF_DIR (file 2F00 under MF)
         self.coms.push(self.SELECT_FILE(P1=0x00, P2=0x00, Data=[0x2F, 0x00]))
-        
-        if self.coms()[2] != (0x90, 0x00) and self.coms()[2][0] != 0x61:
+
+        sw = self.coms()[2]
+        if sw != (0x90, 0x00) and sw[0] != 0x61:
+            if self.dbg:
+                log(1, '(ISIM._scan_AID) Cannot select EF_DIR')
             return
-        
+
         # Read records from EF_DIR
         rec_num = 1
-        while True:
+        while rec_num < 20:  # Safety limit
             self.coms.push(self.READ_RECORD(rec_num, 0x04))
-            
-            if self.coms()[2] == (0x90, 0x00) and len(self.coms()[3]) > 0:
+
+            sw = self.coms()[2]
+            if sw == (0x90, 0x00) and len(self.coms()[3]) > 0:
                 data = self.coms()[3]
-                # Parse TLV structure for AID (tag 0x61 contains application template)
-                if len(data) > 2 and data[0] == 0x61:
-                    # Look for AID tag (0x4F)
-                    i = 2  # Skip template tag and length
+                # Parse TLV structure for AID
+                # Format: 61 L1 [4F L2 AID] [50 L3 label] ...
+                if len(data) > 4 and data[0] == 0x61:
+                    # Application template tag
+                    i = 2  # Skip 61 and length
                     while i < len(data) - 1:
                         tag = data[i]
+                        if i + 1 >= len(data):
+                            break
                         length = data[i + 1]
                         if tag == 0x4F and i + 2 + length <= len(data):
-                            aid = data[i + 2:i + 2 + length]
+                            # AID tag found
+                            aid = list(data[i + 2:i + 2 + length])
                             self.AID.append(aid)
                             break
                         i += 2 + length
                 rec_num += 1
             else:
+                # No more records or error
                 break
-    
-    def get_impi(self):
-        """
-        Read IMPI (IP Multimedia Private Identity) from EF_IMPI
-        
-        Returns the IMPI as a string, or None on error
-        """
-        # Select EF_IMPI
-        self.coms.push(self.SELECT_FILE(P1=0x00, P2=0x04, 
-                                        Data=[0x6F, 0x02]))
-        
-        if self.coms()[2] != (0x90, 0x00) and self.coms()[2][0] != 0x61:
-            if self.dbg:
-                log(1, '(get_impi) cannot select EF_IMPI')
-            return None
-        
-        # Handle response data if present
-        if self.coms()[2][0] == 0x61:
-            self.coms.push(self.GET_RESPONSE(Le=self.coms()[2][1]))
-        
-        # Read binary content
-        self.coms.push(self.READ_BINARY(0, 0))
-        
-        if self.coms()[2] == (0x90, 0x00):
-            data = self.coms()[3]
-            # IMPI is stored as NAI TLV (tag 0x80)
-            if len(data) > 2 and data[0] == 0x80:
-                length = data[1]
-                impi_bytes = data[2:2 + length]
-                return ''.join([chr(b) for b in impi_bytes])
-        
-        return None
-    
-    def get_impu(self, rec_num=1):
-        """
-        Read IMPU (IP Multimedia Public Identity) from EF_IMPU
-        
-        Args:
-            rec_num: Record number (1-based) to read
-            
-        Returns the IMPU as a string, or None on error
-        """
-        # Select EF_IMPU
-        self.coms.push(self.SELECT_FILE(P1=0x00, P2=0x04,
-                                        Data=[0x6F, 0x04]))
-        
-        if self.coms()[2] != (0x90, 0x00) and self.coms()[2][0] != 0x61:
-            if self.dbg:
-                log(1, '(get_impu) cannot select EF_IMPU')
-            return None
-        
-        # Handle response data
-        if self.coms()[2][0] == 0x61:
-            self.coms.push(self.GET_RESPONSE(Le=self.coms()[2][1]))
-        
-        # Read record
-        self.coms.push(self.READ_RECORD(rec_num, 0x04))
-        
-        if self.coms()[2] == (0x90, 0x00):
-            data = self.coms()[3]
-            # IMPU is stored as URI TLV (tag 0x80)
-            if len(data) > 2 and data[0] == 0x80:
-                length = data[1]
-                impu_bytes = data[2:2 + length]
-                return ''.join([chr(b) for b in impu_bytes])
-        
-        return None
-    
-    def get_domain(self):
-        """
-        Read Home Network Domain Name from EF_DOMAIN
-        
-        Returns the domain name as a string, or None on error
-        """
-        # Select EF_DOMAIN
-        self.coms.push(self.SELECT_FILE(P1=0x00, P2=0x04,
-                                        Data=[0x6F, 0x03]))
-        
-        if self.coms()[2] != (0x90, 0x00) and self.coms()[2][0] != 0x61:
-            if self.dbg:
-                log(1, '(get_domain) cannot select EF_DOMAIN')
-            return None
-        
-        # Handle response data
-        if self.coms()[2][0] == 0x61:
-            self.coms.push(self.GET_RESPONSE(Le=self.coms()[2][1]))
-        
-        # Read binary content
-        self.coms.push(self.READ_BINARY(0, 0))
-        
-        if self.coms()[2] == (0x90, 0x00):
-            data = self.coms()[3]
-            # Domain is stored as TLV (tag 0x80)
-            if len(data) > 2 and data[0] == 0x80:
-                length = data[1]
-                domain_bytes = data[2:2 + length]
-                return ''.join([chr(b) for b in domain_bytes])
-        
-        return None
-    
+
     def authenticate(self, RAND=[], AUTN=[], ctx='3G'):
         """
         Run IMS AKA authentication using AUTHENTICATE command
-        
-        self.authenticate(RAND, AUTN, ctx='3G') -> [key1, key2...],
-        LV parsing style
-        
-        Runs the INTERNAL AUTHENTICATE command in the ISIM
-        with the right context:
-            ctx = '3G', 'GBA' ('HTTP-DIGEST' not recommended for 3GPP)
-            RAND and AUTN are list of bytes
-            
-        Returns a list containing the keys (list of bytes) computed 
-        in the ISIM, on success:
-            [RES, CK, IK] or [AUTS] for '3G' / IMS AKA
-            [RES] or [AUTS] for 'GBA'
-        or None on error
-        
-        Based on 3GPP TS 31.103 section 7.1 (AUTHENTICATE function)
+
+        self.authenticate(RAND, AUTN, ctx='3G') -> [RES, CK, IK] or [AUTS] or None
+
+        Args:
+            RAND: 16-byte random challenge (list of ints)
+            AUTN: 16-byte authentication token (list of ints)
+            ctx: '3G' for IMS AKA (default), 'GBA' for GBA bootstrapping
+
+        Returns:
+            On success: [RES, CK, IK] - list of 3 byte arrays
+            On sync failure: [AUTS] - list with single AUTS byte array
+            On error: None
+
+        Note: ISIM application must be selected first (check self.ISIM_selected)
+
+        Example:
+            isim = ISIM()
+            if not isim.ISIM_selected:
+                print("ERROR: ISIM not selected")
+            else:
+                RAND = [0xC0, 0x53, 0x6F, 0xCF, 0x8F, 0x6D, 0xA7, 0x9F,
+                        0xF7, 0x1C, 0x8E, 0xAF, 0x9C, 0x20, 0x49, 0x95]
+                AUTN = [0xB5, 0x21, 0x69, 0xCA, 0xFE, 0xBB, 0x00, 0xFF,
+                        0x12, 0x8F, 0xAF, 0x09, 0x46, 0xA6, 0xFA, 0xE1]
+                result = isim.authenticate(RAND, AUTN)
         """
+        # Check if ISIM is selected
+        if not self.ISIM_selected:
+            if self.dbg:
+                log(1, '(authenticate) ERROR: ISIM application not selected')
+            return None
+
         # Validate input parameters
-        if ctx in ('3G', 'GBA') and len(RAND) != 16:
+        if len(RAND) != 16:
             if self.dbg:
-                log(1, '(authenticate) bad RAND parameter (must be 16 bytes): aborting')
+                log(1, '(authenticate) ERROR: RAND must be 16 bytes, got %d' % len(RAND))
             return None
-        
-        if ctx == '3G' and len(AUTN) != 16:
+
+        if ctx in ('3G', 'GBA') and len(AUTN) != 16:
             if self.dbg:
-                log(1, '(authenticate) bad AUTN parameter (must be 16 bytes): aborting')
+                log(1, '(authenticate) ERROR: AUTN must be 16 bytes, got %d' % len(AUTN))
             return None
-        
-        # Build input data and set P2 based on context
-        inp = []
-        
+
+        # Build command data
+        # Format: Length(RAND) | RAND | Length(AUTN) | AUTN
+        # Total: 1 + 16 + 1 + 16 = 34 bytes
+
         if ctx == '3G':
-            # IMS AKA context (same as USIM 3G context)
+            # IMS AKA / 3G security context
+            # P2 = 0x81 means "UMTS/3G authentication context"
             P2 = 0x81
-            inp = [0xDD]  # Tag for 3G security context
-            inp.extend([len(RAND)] + RAND + [len(AUTN)] + AUTN)
-            
         elif ctx == 'GBA':
             # GBA bootstrapping context
             P2 = 0x84
-            inp = [0xDD]  # Tag for GBA security context
-            inp.extend([len(RAND)] + RAND + [len(AUTN)] + AUTN)
-            
         else:
             if self.dbg:
-                log(1, '(authenticate) unsupported context %s: aborting' % ctx)
+                log(1, '(authenticate) ERROR: unsupported context: %s' % ctx)
             return None
-        
-        # Send AUTHENTICATE command (INS = 0x88)
-        self.coms.push(self.INTERNAL_AUTHENTICATE(P2=P2, Data=inp))
-        
-        # Process response
-        if self.coms()[2][0] in (0x9F, 0x61):
-            # Response data available, get it
-            self.coms.push(self.GET_RESPONSE(Le=self.coms()[2][1]))
-            
-            if self.coms()[2] == (0x90, 0x00):
-                val = self.coms()[3]
-                return self._parse_auth_response(val, ctx)
-        
-        elif self.coms()[2] == (0x90, 0x00):
-            # Response data already in response
-            if len(self.coms()[3]) > 0:
-                return self._parse_auth_response(self.coms()[3], ctx)
-        
-        # Check for specific error codes
-        sw1, sw2 = self.coms()[2]
-        
-        if sw1 == 0x98:
-            if sw2 == 0x62:
-                if self.dbg:
-                    log(1, '(authenticate) authentication error, no attempt left')
-            elif sw2 == 0x64:
-                if self.dbg:
-                    log(1, '(authenticate) authentication error, '
-                        'verification failed, more attempts')
-            elif sw2 == 0x65:
-                if self.dbg:
-                    log(1, '(authenticate) authentication error, '
-                        'verification failed, no more attempts')
-        
+
+        # Build data: 0x10 | RAND[16] | 0x10 | AUTN[16]
+        data = [len(RAND)] + list(RAND) + [len(AUTN)] + list(AUTN)
+
         if self.dbg:
-            log(1, '(authenticate) failed with SW: %02X%02X' % (sw1, sw2))
-        
+            log(3, '(authenticate) Sending AUTHENTICATE with P2=%02X' % P2)
+            log(3, '(authenticate) Data length: %d bytes' % len(data))
+
+        # Send AUTHENTICATE command (INS = 0x88)
+        self.coms.push(self.INTERNAL_AUTHENTICATE(P2=P2, Data=data))
+
+        sw = self.coms()[2]
+
+        if self.dbg:
+            log(3, '(authenticate) Response SW: %02X %02X' % (sw[0], sw[1]))
+
+        # Check response
+        if sw[0] in (0x9F, 0x61):
+            # Response data available, need to GET RESPONSE
+            le = sw[1]
+            self.coms.push(self.GET_RESPONSE(Le=le))
+
+            if self.coms()[2] == (0x90, 0x00):
+                resp_data = self.coms()[3]
+                if self.dbg:
+                    log(3, '(authenticate) Got %d bytes of response data' % len(resp_data))
+                return self._parse_auth_response(resp_data, P2)
+
+        elif sw == (0x90, 0x00):
+            # Response data included directly
+            resp_data = self.coms()[3]
+            if len(resp_data) > 0:
+                return self._parse_auth_response(resp_data, P2)
+
+        # Handle specific error codes
+        if sw[0] == 0x98:
+            errors = {
+                0x62: 'authentication error, no attempt left',
+                0x64: 'authentication error, at least one attempt left',
+                0x65: 'authentication error, no attempt left',
+            }
+            if self.dbg:
+                msg = errors.get(sw[1], 'unknown authentication error')
+                log(1, '(authenticate) %s' % msg)
+
+        elif sw == (0x6D, 0x00):
+            if self.dbg:
+                log(1, '(authenticate) ERROR: Instruction not supported (6D00)')
+                log(1, '(authenticate) This usually means ISIM is not selected')
+
+        elif sw == (0x6E, 0x00):
+            if self.dbg:
+                log(1, '(authenticate) ERROR: Class not supported (6E00)')
+
+        elif sw == (0x69, 0x82):
+            if self.dbg:
+                log(1, '(authenticate) ERROR: Security status not satisfied (6982)')
+                log(1, '(authenticate) PIN verification may be required')
+
+        else:
+            if self.dbg:
+                log(1, '(authenticate) ERROR: Unexpected SW %02X %02X' % (sw[0], sw[1]))
+
         return None
-    
-    def _parse_auth_response(self, val, ctx):
+
+    def _parse_auth_response(self, data, P2):
         """
         Parse the AUTHENTICATE response data
-        
-        Returns list of key values extracted from response
+
+        Returns:
+            Success: [RES, CK, IK]
+            Sync failure: [AUTS]
+            Error: None
         """
-        if len(val) < 1:
+        if len(data) < 1:
             return None
-        
-        result = []
-        
-        # Check response tag
-        tag = val[0]
-        
-        if tag == 0xDB:
-            # Successful authentication (3G/IMS AKA)
-            # Format: DB L1 [RES] DC L2 [CK] DD L3 [IK]
-            idx = 1
-            
-            while idx < len(val) - 1:
-                t = val[idx]
-                l = val[idx + 1]
-                
-                if idx + 2 + l > len(val):
-                    break
-                
-                v = val[idx + 2:idx + 2 + l]
-                result.append(v)
-                idx += 2 + l
-            
-            return result if result else None
-        
-        elif tag == 0xDC:
-            # Synchronisation failure - AUTS returned
-            # Format: DC L [AUTS]
-            if len(val) > 2:
-                l = val[1]
-                auts = val[2:2 + l]
-                return [auts]
-            return None
-        
-        elif tag == 0xDE:
-            # GBA response
-            idx = 1
-            while idx < len(val) - 1:
-                t = val[idx]
-                l = val[idx + 1]
-                if idx + 2 + l > len(val):
-                    break
-                v = val[idx + 2:idx + 2 + l]
-                result.append(v)
-                idx += 2 + l
-            return result if result else None
-        
-        # Unknown tag, try parsing as LV structure
-        idx = 0
-        while idx < len(val):
-            if idx >= len(val):
-                break
-            l = val[idx]
-            if l == 0 or idx + 1 + l > len(val):
-                break
-            v = val[idx + 1:idx + 1 + l]
-            result.append(v)
-            idx += 1 + l
-        
-        return result if result else None
-    
-    def GBA_derivation(self, NAF_ID=[], IMPI=[]):
-        """
-        Run GBA key derivation using AUTHENTICATE command
-        
-        self.GBA_derivation(NAF_ID, IMPI) -> [Ks_ext_naf]
-        
-        Runs the INTERNAL AUTHENTICATE command in the ISIM
-        with the GBA derivation context:
-            NAF_ID is a list of bytes:
-                "NAF domain name"||"security protocol id"
-            IMPI is a list of bytes:
-                The ISIM's IMPI
-                
-        Returns a list with GBA ext key (list of bytes) computed 
-        in the ISIM:
-            [Ks_ext_naf]
-        or None on error
-        
-        See TS 33.220 for GBA specific formats
-        """
-        if len(NAF_ID) == 0:
-            if self.dbg:
-                log(1, '(GBA_derivation) empty NAF_ID: aborting')
-            return None
-        
-        # Build input data for GBA derivation (P2 = 0x85)
-        P2 = 0x85
-        inp = [0xDE]  # Tag for GBA NAF derivation
-        inp.extend([len(NAF_ID)] + NAF_ID)
-        inp.extend([len(IMPI)] + IMPI)
-        
-        # Send AUTHENTICATE command
-        self.coms.push(self.INTERNAL_AUTHENTICATE(P2=P2, Data=inp))
-        
-        if self.coms()[2][0] in (0x9F, 0x61):
-            self.coms.push(self.GET_RESPONSE(Le=self.coms()[2][1]))
-            
-            if self.coms()[2] == (0x90, 0x00):
-                val = self.coms()[3]
-                # Parse response for Ks_ext_naf
-                if len(val) > 2:
-                    result = []
-                    idx = 0
-                    while idx < len(val) - 1:
-                        l = val[idx]
-                        if l == 0 or idx + 1 + l > len(val):
-                            break
-                        v = val[idx + 1:idx + 1 + l]
-                        result.append(v)
-                        idx += 1 + l
-                    return result if result else None
-        
+
+        tag = data[0]
+
         if self.dbg:
-            log(1, '(GBA_derivation) failed with SW: %02X%02X' 
-                % self.coms()[2])
+            log(3, '(_parse_auth_response) Response tag: %02X' % tag)
+            log(3, '(_parse_auth_response) Full response: %s' %
+                ' '.join(['%02X' % b for b in data]))
+
+        # Tag 0xDB = successful 3G authentication
+        # Response: DB L1 RES DC L2 CK DD L3 IK
+        if tag == 0xDB:
+            result = []
+            idx = 1
+            while idx < len(data):
+                if idx >= len(data):
+                    break
+                length = data[idx]
+                idx += 1
+                if idx + length > len(data):
+                    break
+                value = list(data[idx:idx + length])
+                result.append(value)
+                idx += length
+
+            if self.dbg:
+                log(3, '(_parse_auth_response) Successful auth, got %d values' % len(result))
+            return result if len(result) >= 1 else None
+
+        # Tag 0xDC = synchronization failure, AUTS returned
+        # Response: DC L AUTS
+        elif tag == 0xDC:
+            if len(data) >= 2:
+                length = data[1]
+                if len(data) >= 2 + length:
+                    auts = list(data[2:2 + length])
+                    if self.dbg:
+                        log(3, '(_parse_auth_response) Sync failure, AUTS returned')
+                    return [auts]
+            return None
+
+        # No tag - try LV parsing (some cards don't use tags)
+        # Format: L1 RES L2 CK L3 IK
+        else:
+            if self.dbg:
+                log(3, '(_parse_auth_response) No tag, trying LV parsing')
+
+            result = []
+            idx = 0
+            while idx < len(data):
+                length = data[idx]
+                idx += 1
+                if length == 0 or idx + length > len(data):
+                    break
+                value = list(data[idx:idx + length])
+                result.append(value)
+                idx += length
+
+            return result if len(result) >= 1 else None
+
+    def get_impi(self):
+        """
+        Read IMPI (IP Multimedia Private Identity) from EF_IMPI
+
+        Returns the IMPI as a string, or None on error
+        """
+        if not self.ISIM_selected:
+            return None
+
+        # Select EF_IMPI (6F02)
+        self.coms.push(self.SELECT_FILE(P1=0x00, P2=0x04,
+                                        Data=[0x6F, 0x02]))
+
+        sw = self.coms()[2]
+        if sw != (0x90, 0x00) and sw[0] != 0x61:
+            return None
+
+        if sw[0] == 0x61:
+            self.coms.push(self.GET_RESPONSE(Le=sw[1]))
+
+        # Read binary
+        self.coms.push(self.READ_BINARY(0, 0))
+
+        if self.coms()[2] == (0x90, 0x00):
+            data = self.coms()[3]
+            # IMPI is TLV with tag 0x80
+            if len(data) > 2 and data[0] == 0x80:
+                length = data[1]
+                return bytes(data[2:2 + length]).decode('utf-8', errors='ignore')
+
         return None
 
+    def get_impu(self, rec_num=1):
+        """
+        Read IMPU (IP Multimedia Public Identity) from EF_IMPU
 
-# Helper function to create ISIM instance
-def ISIM_card(reader=''):
-    """
-    Create and return an ISIM card instance
-    
-    Args:
-        reader: Optional reader name/index
-        
-    Returns:
-        ISIM instance, or None if ISIM application not found
-    """
-    try:
-        isim = ISIM(reader=reader)
-        if isim.AID_ISIM:
-            return isim
-        else:
-            isim.disconnect()
+        Args:
+            rec_num: Record number (1-based)
+
+        Returns the IMPU as a string, or None on error
+        """
+        if not self.ISIM_selected:
             return None
-    except Exception as e:
-        log(1, '(ISIM_card) error: %s' % str(e))
+
+        # Select EF_IMPU (6F04)
+        self.coms.push(self.SELECT_FILE(P1=0x00, P2=0x04,
+                                        Data=[0x6F, 0x04]))
+
+        sw = self.coms()[2]
+        if sw != (0x90, 0x00) and sw[0] != 0x61:
+            return None
+
+        if sw[0] == 0x61:
+            self.coms.push(self.GET_RESPONSE(Le=sw[1]))
+
+        # Read record
+        self.coms.push(self.READ_RECORD(rec_num, 0x04))
+
+        if self.coms()[2] == (0x90, 0x00):
+            data = self.coms()[3]
+            # IMPU is TLV with tag 0x80
+            if len(data) > 2 and data[0] == 0x80:
+                length = data[1]
+                return bytes(data[2:2 + length]).decode('utf-8', errors='ignore')
+
+        return None
+
+    def get_domain(self):
+        """
+        Read Home Network Domain Name from EF_DOMAIN
+
+        Returns the domain as a string, or None on error
+        """
+        if not self.ISIM_selected:
+            return None
+
+        # Select EF_DOMAIN (6F03)
+        self.coms.push(self.SELECT_FILE(P1=0x00, P2=0x04,
+                                        Data=[0x6F, 0x03]))
+
+        sw = self.coms()[2]
+        if sw != (0x90, 0x00) and sw[0] != 0x61:
+            return None
+
+        if sw[0] == 0x61:
+            self.coms.push(self.GET_RESPONSE(Le=sw[1]))
+
+        # Read binary
+        self.coms.push(self.READ_BINARY(0, 0))
+
+        if self.coms()[2] == (0x90, 0x00):
+            data = self.coms()[3]
+            # Domain is TLV with tag 0x80
+            if len(data) > 2 and data[0] == 0x80:
+                length = data[1]
+                return bytes(data[2:2 + length]).decode('utf-8', errors='ignore')
+
         return None
